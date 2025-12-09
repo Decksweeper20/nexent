@@ -728,7 +728,7 @@ class TestElasticSearchService(unittest.TestCase):
         This test verifies that:
         1. When an error occurs during indexing, an appropriate exception is raised
         2. The exception has the correct status code (500)
-        3. The exception message contains "Error during indexing"
+        3. The exception message contains the original error message
         """
         # Setup
         self.mock_vdb_core.check_index_exists.return_value = True
@@ -757,7 +757,7 @@ class TestElasticSearchService(unittest.TestCase):
                     embedding_model=mock_embedding_model
                 )
 
-        self.assertIn("Error during indexing", str(context.exception))
+        self.assertIn("Indexing error", str(context.exception))
         _, kwargs = self.mock_vdb_core.vectorize_documents.call_args
         self.assertEqual(kwargs.get("embedding_batch_size"), 8)
         self.assertTrue(callable(kwargs.get("progress_callback")))

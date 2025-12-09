@@ -43,7 +43,8 @@ class TestRedisService(unittest.TestCase):
         mock_from_url.assert_called_once_with(
             'redis://localhost:6379/0', 
             socket_timeout=5, 
-            socket_connect_timeout=5
+            socket_connect_timeout=5,
+            decode_responses=True
         )
         self.assertEqual(client, self.mock_redis_client)
         
@@ -804,6 +805,470 @@ class TestRedisService(unittest.TestCase):
         self.assertFalse(result)
         self.mock_redis_client.ping.assert_called_once()
         self.mock_backend_client.ping.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Test mark_task_cancelled edge cases
+    # ------------------------------------------------------------------
+
+    def test_mark_task_cancelled_empty_task_id(self):
+        """Test mark_task_cancelled returns False when task_id is empty"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.mark_task_cancelled("")
+        self.assertFalse(result)
+        self.mock_redis_client.setex.assert_not_called()
+
+    def test_mark_task_cancelled_redis_error(self):
+        """Test mark_task_cancelled handles Redis errors gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.side_effect = redis.RedisError("Connection failed")
+        
+        result = self.redis_service.mark_task_cancelled("task-123")
+        self.assertFalse(result)
+        self.mock_redis_client.setex.assert_called_once()
+
+    def test_mark_task_cancelled_custom_ttl(self):
+        """Test mark_task_cancelled with custom TTL hours"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.return_value = True
+        
+        result = self.redis_service.mark_task_cancelled("task-123", ttl_hours=48)
+        self.assertTrue(result)
+        # Verify TTL is calculated correctly (48 hours = 172800 seconds)
+        call_args = self.mock_redis_client.setex.call_args
+        self.assertEqual(call_args[0][1], 48 * 3600)  # TTL in seconds
+
+    # ------------------------------------------------------------------
+    # Test is_task_cancelled edge cases
+    # ------------------------------------------------------------------
+
+    def test_is_task_cancelled_empty_task_id(self):
+        """Test is_task_cancelled returns False when task_id is empty"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.is_task_cancelled("")
+        self.assertFalse(result)
+        self.mock_redis_client.get.assert_not_called()
+
+    def test_is_task_cancelled_none_value(self):
+        """Test is_task_cancelled returns False when key doesn't exist"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.return_value = None
+        
+        result = self.redis_service.is_task_cancelled("task-123")
+        self.assertFalse(result)
+
+    def test_is_task_cancelled_empty_string_value(self):
+        """Test is_task_cancelled returns False when value is empty string"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.return_value = ""
+        
+        result = self.redis_service.is_task_cancelled("task-123")
+        self.assertFalse(result)
+
+    def test_is_task_cancelled_redis_error(self):
+        """Test is_task_cancelled handles Redis errors gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.side_effect = redis.RedisError("Connection failed")
+        
+        result = self.redis_service.is_task_cancelled("task-123")
+        self.assertFalse(result)
+
+    # ------------------------------------------------------------------
+    # Test _cleanup_single_task_related_keys
+    # ------------------------------------------------------------------
+
+    def test_cleanup_single_task_related_keys_success(self):
+        """Test _cleanup_single_task_related_keys deletes all related keys"""
+        self.redis_service._client = self.mock_redis_client
+        self.redis_service._backend_client = self.mock_backend_client
+        
+        # Mock successful deletions
+        self.mock_redis_client.delete.side_effect = [1, 1, 1]  # progress, error, cancel
+        self.mock_backend_client.delete.return_value = 1  # chunk cache
+        
+        result = self.redis_service._cleanup_single_task_related_keys("task-123")
+        
+        # Should delete 4 keys total
+        self.assertEqual(result, 4)
+        # Verify all keys were attempted
+        self.assertEqual(self.mock_redis_client.delete.call_count, 3)
+        self.mock_backend_client.delete.assert_called_once_with("dp:task-123:chunks")
+
+    def test_cleanup_single_task_related_keys_empty_task_id(self):
+        """Test _cleanup_single_task_related_keys returns 0 for empty task_id"""
+        result = self.redis_service._cleanup_single_task_related_keys("")
+        self.assertEqual(result, 0)
+
+    def test_cleanup_single_task_related_keys_partial_failure(self):
+        """Test _cleanup_single_task_related_keys handles partial failures"""
+        self.redis_service._client = self.mock_redis_client
+        self.redis_service._backend_client = self.mock_backend_client
+        
+        # First key succeeds, second fails, third succeeds, chunk cache fails
+        self.mock_redis_client.delete.side_effect = [1, redis.RedisError("Error"), 1]
+        self.mock_backend_client.delete.side_effect = redis.RedisError("Backend error")
+        
+        result = self.redis_service._cleanup_single_task_related_keys("task-123")
+        
+        # Should return count of successful deletions (2)
+        self.assertEqual(result, 2)
+
+    def test_cleanup_single_task_related_keys_all_fail(self):
+        """Test _cleanup_single_task_related_keys handles all failures gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.redis_service._backend_client = self.mock_backend_client
+        
+        self.mock_redis_client.delete.side_effect = redis.RedisError("All failed")
+        self.mock_backend_client.delete.side_effect = redis.RedisError("Backend failed")
+        
+        result = self.redis_service._cleanup_single_task_related_keys("task-123")
+        
+        # Should return 0 but not raise exception
+        self.assertEqual(result, 0)
+
+    def test_cleanup_single_task_related_keys_no_keys_exist(self):
+        """Test _cleanup_single_task_related_keys when keys don't exist"""
+        self.redis_service._client = self.mock_redis_client
+        self.redis_service._backend_client = self.mock_backend_client
+        
+        # All deletions return 0 (key doesn't exist)
+        self.mock_redis_client.delete.side_effect = [0, 0, 0]
+        self.mock_backend_client.delete.return_value = 0
+        
+        result = self.redis_service._cleanup_single_task_related_keys("task-123")
+        
+        # Should return 0
+        self.assertEqual(result, 0)
+
+    # ------------------------------------------------------------------
+    # Test save_error_info
+    # ------------------------------------------------------------------
+
+    def test_save_error_info_success(self):
+        """Test save_error_info successfully saves error information"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.return_value = True
+        self.mock_redis_client.get.return_value = "Test error reason"
+        
+        result = self.redis_service.save_error_info("task-123", "Test error reason")
+        
+        self.assertTrue(result)
+        self.mock_redis_client.setex.assert_called_once()
+        # Verify TTL is 30 days in seconds
+        call_args = self.mock_redis_client.setex.call_args
+        self.assertEqual(call_args[0][1], 30 * 24 * 60 * 60)
+        self.assertEqual(call_args[0][2], "Test error reason")
+        # Verify get was called to verify the save
+        self.mock_redis_client.get.assert_called_once()
+
+    def test_save_error_info_empty_task_id(self):
+        """Test save_error_info returns False when task_id is empty"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.save_error_info("", "Error reason")
+        self.assertFalse(result)
+        self.mock_redis_client.setex.assert_not_called()
+
+    def test_save_error_info_empty_error_reason(self):
+        """Test save_error_info returns False when error_reason is empty"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.save_error_info("task-123", "")
+        self.assertFalse(result)
+        self.mock_redis_client.setex.assert_not_called()
+
+    def test_save_error_info_custom_ttl(self):
+        """Test save_error_info with custom TTL days"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.return_value = True
+        self.mock_redis_client.get.return_value = "Error"
+        
+        result = self.redis_service.save_error_info("task-123", "Error", ttl_days=7)
+        
+        self.assertTrue(result)
+        call_args = self.mock_redis_client.setex.call_args
+        # Verify TTL is 7 days in seconds
+        self.assertEqual(call_args[0][1], 7 * 24 * 60 * 60)
+
+    def test_save_error_info_setex_returns_false(self):
+        """Test save_error_info handles setex returning False"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.return_value = False
+        
+        result = self.redis_service.save_error_info("task-123", "Error")
+        self.assertFalse(result)
+
+    def test_save_error_info_verification_fails(self):
+        """Test save_error_info when verification get returns None"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.return_value = True
+        self.mock_redis_client.get.return_value = None  # Verification fails
+        
+        result = self.redis_service.save_error_info("task-123", "Error")
+        # Should still return True because setex succeeded
+        self.assertTrue(result)
+
+    def test_save_error_info_redis_error(self):
+        """Test save_error_info handles Redis errors gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.side_effect = redis.RedisError("Connection failed")
+        
+        result = self.redis_service.save_error_info("task-123", "Error")
+        self.assertFalse(result)
+
+    def test_save_error_info_verification_redis_error(self):
+        """Test save_error_info handles Redis error during verification"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.return_value = True
+        self.mock_redis_client.get.side_effect = redis.RedisError("Connection failed")
+        
+        # Should still return True because setex succeeded
+        result = self.redis_service.save_error_info("task-123", "Error")
+        self.assertTrue(result)
+
+    # ------------------------------------------------------------------
+    # Test save_progress_info
+    # ------------------------------------------------------------------
+
+    def test_save_progress_info_success(self):
+        """Test save_progress_info successfully saves progress"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.save_progress_info("task-123", 50, 100)
+        
+        self.assertTrue(result)
+        self.mock_redis_client.setex.assert_called_once()
+        call_args = self.mock_redis_client.setex.call_args
+        # Verify TTL is 24 hours in seconds
+        self.assertEqual(call_args[0][1], 24 * 3600)
+        # Verify JSON data
+        progress_data = json.loads(call_args[0][2])
+        self.assertEqual(progress_data['processed_chunks'], 50)
+        self.assertEqual(progress_data['total_chunks'], 100)
+
+    def test_save_progress_info_empty_task_id(self):
+        """Test save_progress_info returns False when task_id is empty"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.save_progress_info("", 50, 100)
+        self.assertFalse(result)
+        self.mock_redis_client.setex.assert_not_called()
+
+    def test_save_progress_info_custom_ttl(self):
+        """Test save_progress_info with custom TTL hours"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.save_progress_info("task-123", 25, 50, ttl_hours=48)
+        
+        self.assertTrue(result)
+        call_args = self.mock_redis_client.setex.call_args
+        # Verify TTL is 48 hours in seconds
+        self.assertEqual(call_args[0][1], 48 * 3600)
+
+    def test_save_progress_info_zero_progress(self):
+        """Test save_progress_info with zero progress"""
+        self.redis_service._client = self.mock_redis_client
+        
+        result = self.redis_service.save_progress_info("task-123", 0, 100)
+        
+        self.assertTrue(result)
+        call_args = self.mock_redis_client.setex.call_args
+        progress_data = json.loads(call_args[0][2])
+        self.assertEqual(progress_data['processed_chunks'], 0)
+        self.assertEqual(progress_data['total_chunks'], 100)
+
+    def test_save_progress_info_redis_error(self):
+        """Test save_progress_info handles Redis errors gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.setex.side_effect = redis.RedisError("Connection failed")
+        
+        result = self.redis_service.save_progress_info("task-123", 50, 100)
+        self.assertFalse(result)
+
+    # ------------------------------------------------------------------
+    # Test get_progress_info
+    # ------------------------------------------------------------------
+
+    def test_get_progress_info_success(self):
+        """Test get_progress_info successfully retrieves progress"""
+        self.redis_service._client = self.mock_redis_client
+        progress_json = json.dumps({'processed_chunks': 50, 'total_chunks': 100})
+        self.mock_redis_client.get.return_value = progress_json
+        
+        result = self.redis_service.get_progress_info("task-123")
+        
+        self.assertIsNotNone(result)
+        self.assertEqual(result['processed_chunks'], 50)
+        self.assertEqual(result['total_chunks'], 100)
+
+    def test_get_progress_info_not_found(self):
+        """Test get_progress_info returns None when key doesn't exist"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.return_value = None
+        
+        result = self.redis_service.get_progress_info("task-123")
+        self.assertIsNone(result)
+
+    def test_get_progress_info_bytes_response(self):
+        """Test get_progress_info handles bytes response (when decode_responses=False)"""
+        self.redis_service._client = self.mock_redis_client
+        progress_json = json.dumps({'processed_chunks': 75, 'total_chunks': 150})
+        self.mock_redis_client.get.return_value = progress_json.encode('utf-8')
+        
+        result = self.redis_service.get_progress_info("task-123")
+        
+        self.assertIsNotNone(result)
+        self.assertEqual(result['processed_chunks'], 75)
+        self.assertEqual(result['total_chunks'], 150)
+
+    def test_get_progress_info_invalid_json(self):
+        """Test get_progress_info handles invalid JSON gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.return_value = "invalid json"
+        
+        result = self.redis_service.get_progress_info("task-123")
+        self.assertIsNone(result)
+
+    def test_get_progress_info_redis_error(self):
+        """Test get_progress_info handles Redis errors gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.side_effect = redis.RedisError("Connection failed")
+        
+        result = self.redis_service.get_progress_info("task-123")
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # Test get_error_info
+    # ------------------------------------------------------------------
+
+    def test_get_error_info_success(self):
+        """Test get_error_info successfully retrieves error reason"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.return_value = "Test error reason"
+        
+        result = self.redis_service.get_error_info("task-123")
+        
+        self.assertEqual(result, "Test error reason")
+        self.mock_redis_client.get.assert_called_once_with("error:reason:task-123")
+
+    def test_get_error_info_not_found(self):
+        """Test get_error_info returns None when key doesn't exist"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.return_value = None
+        
+        result = self.redis_service.get_error_info("task-123")
+        self.assertIsNone(result)
+
+    def test_get_error_info_empty_string(self):
+        """Test get_error_info returns None when value is empty string"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.return_value = ""
+        
+        result = self.redis_service.get_error_info("task-123")
+        self.assertIsNone(result)
+
+    def test_get_error_info_redis_error(self):
+        """Test get_error_info handles Redis errors gracefully"""
+        self.redis_service._client = self.mock_redis_client
+        self.mock_redis_client.get.side_effect = redis.RedisError("Connection failed")
+        
+        result = self.redis_service.get_error_info("task-123")
+        self.assertIsNone(result)
+
+    # ------------------------------------------------------------------
+    # Test _cleanup_celery_tasks edge cases
+    # ------------------------------------------------------------------
+
+    def test_cleanup_celery_tasks_mark_cancelled_failure(self):
+        """Test _cleanup_celery_tasks handles mark_task_cancelled failures"""
+        self.redis_service._backend_client = self.mock_backend_client
+        self.redis_service._client = self.mock_redis_client
+        
+        task_keys = [b'celery-task-meta-1']
+        task_data = json.dumps({
+            'result': {'index_name': 'test_index'},
+            'parent_id': None
+        }).encode()
+        
+        self.mock_backend_client.keys.return_value = task_keys
+        # Provide data for both passes
+        self.mock_backend_client.get.side_effect = [task_data, task_data]
+        self.mock_backend_client.delete.return_value = 1
+        
+        # Mock mark_task_cancelled to fail
+        with patch.object(self.redis_service, 'mark_task_cancelled', return_value=False):
+            with patch.object(self.redis_service, '_recursively_delete_task_and_parents', return_value=(1, {'1'})):
+                with patch.object(self.redis_service, '_cleanup_single_task_related_keys', return_value=0):
+                    result = self.redis_service._cleanup_celery_tasks("test_index")
+        
+        # Should still proceed with deletion despite cancellation failure
+        self.assertEqual(result, 1)
+
+    def test_cleanup_celery_tasks_no_matching_tasks(self):
+        """Test _cleanup_celery_tasks when no tasks match the index"""
+        self.redis_service._backend_client = self.mock_backend_client
+        
+        task_keys = [b'celery-task-meta-1']
+        task_data = json.dumps({
+            'result': {'index_name': 'other_index'}
+        }).encode()
+        
+        self.mock_backend_client.keys.return_value = task_keys
+        # Provide data for both passes
+        self.mock_backend_client.get.side_effect = [task_data, task_data]
+        
+        result = self.redis_service._cleanup_celery_tasks("test_index")
+        
+        self.assertEqual(result, 0)
+
+    # ------------------------------------------------------------------
+    # Test _cleanup_document_celery_tasks edge cases
+    # ------------------------------------------------------------------
+
+    def test_cleanup_document_celery_tasks_no_matching_document(self):
+        """Test _cleanup_document_celery_tasks when no tasks match document"""
+        self.redis_service._backend_client = self.mock_backend_client
+        
+        task_keys = [b'celery-task-meta-1']
+        task_data = json.dumps({
+            'result': {
+                'index_name': 'test_index',
+                'source': 'other/doc.pdf'
+            }
+        }).encode()
+        
+        self.mock_backend_client.keys.return_value = task_keys
+        self.mock_backend_client.get.return_value = task_data
+        
+        result = self.redis_service._cleanup_document_celery_tasks("test_index", "path/to/doc.pdf")
+        
+        self.assertEqual(result, 0)
+
+    def test_cleanup_document_celery_tasks_mark_cancelled_failure(self):
+        """Test _cleanup_document_celery_tasks handles mark_task_cancelled failures"""
+        self.redis_service._backend_client = self.mock_backend_client
+        
+        task_keys = [b'celery-task-meta-1']
+        task_data = json.dumps({
+            'result': {
+                'index_name': 'test_index',
+                'source': 'path/to/doc.pdf'
+            }
+        }).encode()
+        
+        self.mock_backend_client.keys.return_value = task_keys
+        self.mock_backend_client.get.return_value = task_data
+        self.mock_backend_client.delete.return_value = 1
+        
+        # Mock mark_task_cancelled to fail
+        with patch.object(self.redis_service, 'mark_task_cancelled', return_value=False):
+            with patch.object(self.redis_service, '_recursively_delete_task_and_parents', return_value=(1, {'1'})):
+                with patch.object(self.redis_service, '_cleanup_single_task_related_keys', return_value=0):
+                    result = self.redis_service._cleanup_document_celery_tasks("test_index", "path/to/doc.pdf")
+        
+        # Should still proceed with deletion
+        self.assertEqual(result, 1)
 
 
 if __name__ == '__main__':
