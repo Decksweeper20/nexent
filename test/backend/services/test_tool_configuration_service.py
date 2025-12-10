@@ -99,6 +99,16 @@ for name in ["truncate_content", "extract_code_from_text"]:
     setattr(mock_smolagents.utils, name, MagicMock(
         name=f"smolagents.utils.{name}"))
 
+# mcpadapt imports a helper from smolagents.utils
+
+
+def _is_package_available(pkg_name: str) -> bool:
+    """Simplified availability check for tests."""
+    return True
+
+
+setattr(mock_smolagents.utils, "_is_package_available", _is_package_available)
+
 # Mock nexent module and its submodules before patching
 
 

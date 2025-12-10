@@ -1134,8 +1134,12 @@ def test_handle_bulk_errors_with_errors(elasticsearch_core_instance):
         ]
     }
 
-    # Should not raise exception, just log errors
-    elasticsearch_core_instance._handle_bulk_errors(response)
+    with pytest.raises(Exception) as exc_info:
+        elasticsearch_core_instance._handle_bulk_errors(response)
+
+    err_payload = str(exc_info.value)
+    assert "Bulk indexing failed: Failed to parse mapping" in err_payload
+    assert "es_bulk_failed" in err_payload
 
 
 def test_handle_bulk_errors_version_conflict(elasticsearch_core_instance):
