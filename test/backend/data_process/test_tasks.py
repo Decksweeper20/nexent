@@ -997,6 +997,328 @@ def test_process_and_forward_returns_chain_id(monkeypatch):
     assert chain_id == "123"
 
 
+def test_extract_error_code_parses_detail_and_regex_and_unknown():
+    from backend.data_process.tasks import extract_error_code
+
+    # detail error_code inside JSON string
+    json_detail = json.dumps({"detail": {"error_code": "detail_code"}})
+    assert extract_error_code(json_detail) == "detail_code"
+
+    # regex fallback when not valid JSON
+    raw = 'oops {"error_code":"regex_code"}'
+    assert extract_error_code(raw) == "regex_code"
+
+    # unknown path
+    assert extract_error_code("no code here") == "unknown_error"
+
+
+def test_save_error_to_redis_branches(monkeypatch):
+    from backend.data_process.tasks import save_error_to_redis
+
+    warnings = []
+    infos = []
+
+    class FakeRedisSvc:
+        def __init__(self, return_val=True):
+            self.return_val = return_val
+            self.calls = []
+
+        def save_error_info(self, tid, reason):
+            self.calls.append((tid, reason))
+            return self.return_val
+
+    # capture logger calls
+    monkeypatch.setattr(
+        "backend.data_process.tasks.logger.warning",
+        lambda msg: warnings.append(msg),
+    )
+    monkeypatch.setattr(
+        "backend.data_process.tasks.logger.info", lambda msg: infos.append(msg)
+    )
+    monkeypatch.setattr(
+        "backend.data_process.tasks.logger.error", lambda *a, **k: warnings.append(a[0])
+    )
+
+    # empty task_id
+    save_error_to_redis("", "r", 0)
+    assert any("task_id is empty" in w for w in warnings)
+    warnings.clear()
+
+    # empty error_reason
+    save_error_to_redis("tid", "", 0)
+    assert any("error_reason is empty" in w for w in warnings)
+    warnings.clear()
+
+    # success True
+    svc_true = FakeRedisSvc(True)
+    monkeypatch.setattr(
+        "backend.data_process.tasks.get_redis_service", lambda: svc_true
+    )
+    save_error_to_redis("tid1", "reason1", 0)
+    assert svc_true.calls == [("tid1", "reason1")]
+    assert any("Successfully saved error info" in i for i in infos)
+
+    # success False
+    infos.clear()
+    svc_false = FakeRedisSvc(False)
+    monkeypatch.setattr(
+        "backend.data_process.tasks.get_redis_service", lambda: svc_false
+    )
+    save_error_to_redis("tid2", "reason2", 0)
+    assert svc_false.calls == [("tid2", "reason2")]
+    assert any("save_error_info returned False" in w for w in warnings)
+
+    # exception path
+    def boom():
+        raise RuntimeError("fail")
+
+    monkeypatch.setattr(
+        "backend.data_process.tasks.get_redis_service", lambda: boom()
+    )
+    save_error_to_redis("tid3", "reason3", 0)
+    assert any("Failed to save error info to Redis" in w for w in warnings)
+
+
+def test_process_error_fallback_when_save_error_raises(monkeypatch, tmp_path):
+    tasks, fake_ray = import_tasks_with_fake_ray(monkeypatch, initialized=True)
+
+    # Force get_ray_actor to raise to enter error handling
+    monkeypatch.setattr(tasks, "get_ray_actor", lambda: (_ for _ in ()).throw(
+        Exception("x" * 250)
+    ))
+
+    # Make save_error_to_redis raise to hit fallback block
+    monkeypatch.setattr(
+        tasks,
+        "save_error_to_redis",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("save-fail")),
+    )
+
+    self = FakeSelf("err-fallback")
+    with pytest.raises(Exception):
+        tasks.process(
+            self,
+            source=str(tmp_path / "missing.txt"),
+            source_type="local",
+            chunking_strategy="basic",
+            index_name="idx",
+            original_filename="file.txt",
+        )
+
+    # State should still be updated in fallback branch
+    assert any(
+        s.get("meta", {}).get("stage") == "text_extraction_failed"
+        for s in self.states
+    )
+
+
+def test_forward_cancel_check_warning_then_continue(monkeypatch):
+    tasks, _ = import_tasks_with_fake_ray(monkeypatch)
+    monkeypatch.setattr(tasks, "ELASTICSEARCH_SERVICE", "http://api")
+
+    # make cancellation check raise to hit warning path
+    monkeypatch.setattr(tasks, "get_redis_service", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    # run index_documents normally via stubbed run_async returning success
+    monkeypatch.setattr(
+        tasks,
+        "run_async",
+        lambda coro: {"success": True, "total_indexed": 1, "total_submitted": 1, "message": "ok"},
+    )
+
+    self = FakeSelf("warn-cancel")
+    result = tasks.forward(
+        self,
+        processed_data={"chunks": [{"content": "c", "metadata": {}}]},
+        index_name="idx",
+        source="/a.txt",
+        authorization="Bearer 1",
+    )
+    assert result["chunks_stored"] == 1
+
+
+def _run_coro(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def test_forward_index_documents_error_code_from_detail(monkeypatch):
+    tasks, _ = import_tasks_with_fake_ray(monkeypatch)
+    monkeypatch.setattr(tasks, "ELASTICSEARCH_SERVICE", "http://api")
+
+    class FakeResponse:
+        status = 500
+
+        async def text(self):
+            return json.dumps({"detail": {"error_code": "detail_err"}})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def post(self, *a, **k):
+            return FakeResponse()
+
+    fake_aiohttp = types.SimpleNamespace(
+        TCPConnector=lambda verify_ssl=False: None,
+        ClientTimeout=lambda total=None: None,
+        ClientSession=FakeSession,
+        ClientConnectorError=Exception,
+        ClientResponseError=Exception,
+    )
+    monkeypatch.setattr(tasks, "aiohttp", fake_aiohttp)
+    monkeypatch.setattr(tasks, "run_async", _run_coro)
+
+    self = FakeSelf("detail-err")
+    with pytest.raises(Exception) as exc:
+        tasks.forward(
+            self,
+            processed_data={"chunks": [{"content": "x", "metadata": {}}]},
+            index_name="idx",
+            source="/a.txt",
+            authorization="Bearer token",
+        )
+    assert "detail_err" in str(exc.value)
+
+
+def test_forward_index_documents_client_connector_error(monkeypatch):
+    tasks, _ = import_tasks_with_fake_ray(monkeypatch)
+    monkeypatch.setattr(tasks, "ELASTICSEARCH_SERVICE", "http://api")
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def post(self, *a, **k):
+            raise tasks.aiohttp.ClientConnectorError("down")
+
+    fake_aiohttp = types.SimpleNamespace(
+        ClientConnectorError=Exception,
+        TCPConnector=lambda verify_ssl=False: None,
+        ClientTimeout=lambda total=None: None,
+        ClientSession=FakeSession,
+        ClientResponseError=Exception,
+    )
+    monkeypatch.setattr(tasks, "aiohttp", fake_aiohttp)
+    monkeypatch.setattr(tasks, "run_async", _run_coro)
+
+    self = FakeSelf("conn-err")
+    with pytest.raises(Exception) as exc:
+        tasks.forward(
+            self,
+            processed_data={"chunks": [{"content": "x", "metadata": {}}]},
+            index_name="idx",
+            source="/a.txt",
+        )
+    assert "Failed to connect to API" in str(exc.value)
+
+
+def test_forward_index_documents_timeout(monkeypatch):
+    tasks, _ = import_tasks_with_fake_ray(monkeypatch)
+    monkeypatch.setattr(tasks, "ELASTICSEARCH_SERVICE", "http://api")
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def post(self, *a, **k):
+            raise asyncio.TimeoutError("t/o")
+
+    fake_aiohttp = types.SimpleNamespace(
+        ClientConnectorError=Exception,
+        ClientResponseError=Exception,
+        TCPConnector=lambda verify_ssl=False: None,
+        ClientTimeout=lambda total=None: None,
+        ClientSession=FakeSession,
+    )
+    monkeypatch.setattr(tasks, "aiohttp", fake_aiohttp)
+    monkeypatch.setattr(tasks, "run_async", _run_coro)
+
+    self = FakeSelf("timeout-err")
+    with pytest.raises(Exception) as exc:
+        tasks.forward(
+            self,
+            processed_data={"chunks": [{"content": "x", "metadata": {}}]},
+            index_name="idx",
+            source="/a.txt",
+        )
+    assert "Timeout when indexing documents" in str(exc.value)
+
+
+def test_forward_error_truncates_reason_and_uses_save(monkeypatch):
+    tasks, _ = import_tasks_with_fake_ray(monkeypatch)
+    long_message = "m" * 250
+    monkeypatch.setattr(tasks, "ELASTICSEARCH_SERVICE", "http://api")
+    monkeypatch.setattr(
+        tasks, "run_async", lambda coro: (_ for _ in ()).throw(Exception(json.dumps({"message": long_message})))
+    )
+    captured = {}
+    monkeypatch.setattr(
+        tasks, "save_error_to_redis", lambda tid, reason, st: captured.setdefault("reason", reason)
+    )
+
+    self = FakeSelf("trunc")
+    with pytest.raises(Exception):
+        tasks.forward(
+            self,
+            processed_data={"chunks": [{"content": "x", "metadata": {}}]},
+            index_name="idx",
+            source="/a.txt",
+        )
+
+    assert captured["reason"].endswith("...")
+    assert len(captured["reason"]) <= 203
+
+
+def test_forward_error_fallback_when_json_loads_fails(monkeypatch):
+    tasks, _ = import_tasks_with_fake_ray(monkeypatch)
+    monkeypatch.setattr(tasks, "ELASTICSEARCH_SERVICE", "http://api")
+    monkeypatch.setattr(
+        tasks, "run_async", lambda coro: (_ for _ in ()).throw(Exception("not-json-error"))
+    )
+    captured = {}
+    monkeypatch.setattr(
+        tasks, "save_error_to_redis", lambda tid, reason, st: captured.setdefault("reason", reason)
+    )
+
+    self = FakeSelf("fallback-forward")
+    with pytest.raises(Exception):
+        tasks.forward(
+            self,
+            processed_data={"chunks": [{"content": "x", "metadata": {}}]},
+            index_name="idx",
+            source="/a.txt",
+        )
+
+    assert captured["reason"]
+    assert any(
+        s.get("meta", {}).get("stage") == "forward_task_failed" for s in self.states
+    )
+
+
 def test_process_sync_local_returns(monkeypatch):
     tasks, fake_ray = import_tasks_with_fake_ray(monkeypatch, initialized=True)
 

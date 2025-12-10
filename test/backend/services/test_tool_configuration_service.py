@@ -2198,6 +2198,73 @@ class TestValidateLocalToolKnowledgeBaseSearch:
     @patch('backend.services.tool_configuration_service.build_knowledge_name_mapping')
     @patch('backend.services.tool_configuration_service.get_embedding_model')
     @patch('backend.services.tool_configuration_service.get_vector_db_core')
+    @patch('backend.services.tool_configuration_service.get_index_name_by_knowledge_name')
+    def test_validate_local_tool_knowledge_base_search_resolves_inputs_indices(self,
+                                                                               mock_get_index_name,
+                                                                               mock_get_vector_db_core,
+                                                                               mock_get_embedding_model,
+                                                                               mock_build_mapping,
+                                                                               mock_get_knowledge_list,
+                                                                               mock_signature,
+                                                                               mock_get_class):
+        """Resolve index_names from user input when no stored selections exist."""
+        mock_tool_class = Mock()
+        mock_tool_instance = Mock()
+        mock_tool_instance.forward.return_value = "resolved result"
+        mock_tool_class.return_value = mock_tool_instance
+        mock_get_class.return_value = mock_tool_class
+
+        mock_sig = Mock()
+        mock_sig.parameters = {
+            'self': Mock(),
+            'index_names': Mock(),
+            'vdb_core': Mock(),
+            'embedding_model': Mock()
+        }
+        mock_signature.return_value = mock_sig
+
+        mock_get_knowledge_list.return_value = []  # No stored selections
+        mock_build_mapping.return_value = {"existing": "existing_index"}
+        mock_get_embedding_model.return_value = "mock_embedding"
+        mock_vdb_core = Mock()
+        mock_get_vector_db_core.return_value = mock_vdb_core
+
+        # First alias resolves; second keeps raw value on exception
+        mock_get_index_name.side_effect = [
+            "resolved_index", Exception("not found")]
+
+        from backend.services.tool_configuration_service import _validate_local_tool
+
+        result = _validate_local_tool(
+            "knowledge_base_search",
+            {"query": "q", "index_names": ["alias1", "raw_index"]},
+            {"param": "config"},
+            "tenant1",
+            "user1"
+        )
+
+        assert result == "resolved result"
+        expected_params = {
+            "param": "config",
+            "index_names": ["resolved_index", "raw_index"],
+            "name_resolver": {"existing": "existing_index", "alias1": "resolved_index"},
+            "vdb_core": mock_vdb_core,
+            "embedding_model": "mock_embedding",
+        }
+        mock_tool_class.assert_called_once_with(**expected_params)
+        mock_tool_instance.forward.assert_called_once_with(
+            query="q", index_names=["alias1", "raw_index"]
+        )
+        assert mock_get_index_name.call_count == 2
+        mock_get_index_name.assert_any_call("alias1", tenant_id="tenant1")
+        mock_get_index_name.assert_any_call("raw_index", tenant_id="tenant1")
+
+    @patch('backend.services.tool_configuration_service._get_tool_class_by_name')
+    @patch('backend.services.tool_configuration_service.inspect.signature')
+    @patch('backend.services.tool_configuration_service.get_selected_knowledge_list')
+    @patch('backend.services.tool_configuration_service.build_knowledge_name_mapping')
+    @patch('backend.services.tool_configuration_service.get_embedding_model')
+    @patch('backend.services.tool_configuration_service.get_vector_db_core')
     def test_validate_local_tool_knowledge_base_search_execution_error(self, mock_get_vector_db_core,
                                                                        mock_get_embedding_model,
                                                                        mock_build_mapping,

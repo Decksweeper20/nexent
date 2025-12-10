@@ -406,6 +406,35 @@ async def test_create_model_for_tenant_embedding_sets_dimension():
 
 
 @pytest.mark.asyncio
+async def test_create_model_for_tenant_embedding_sets_default_chunk_batch():
+    """chunk_batch defaults to 10 when not provided for embedding models."""
+    svc = import_svc()
+
+    with mock.patch.object(svc, "get_model_by_display_name", return_value=None), \
+            mock.patch.object(svc, "embedding_dimension_check", new=mock.AsyncMock(return_value=512)) as mock_dim, \
+            mock.patch.object(svc, "create_model_record") as mock_create, \
+            mock.patch.object(svc, "split_repo_name", return_value=("openai", "text-embedding-3-small")):
+
+        user_id = "u1"
+        tenant_id = "t1"
+        model_data = {
+            "model_name": "openai/text-embedding-3-small",
+            "display_name": None,
+            "base_url": "https://api.openai.com",
+            "model_type": "embedding",
+            "chunk_batch": None,  # Explicitly unset to exercise defaulting
+        }
+
+        await svc.create_model_for_tenant(user_id, tenant_id, model_data)
+
+        mock_dim.assert_awaited_once()
+        assert mock_create.call_count == 1
+        # chunk_batch should be defaulted before persistence
+        create_args = mock_create.call_args[0][0]
+        assert create_args["chunk_batch"] == 10
+
+
+@pytest.mark.asyncio
 async def test_create_provider_models_for_tenant_success():
     svc = import_svc()
 
