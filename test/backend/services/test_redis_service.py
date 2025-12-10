@@ -1018,14 +1018,14 @@ class TestRedisService(unittest.TestCase):
         self.assertFalse(result)
 
     def test_save_error_info_verification_redis_error(self):
-        """Test save_error_info handles Redis error during verification"""
+        """Test save_error_info returns False when verification raises Redis error"""
         self.redis_service._client = self.mock_redis_client
         self.mock_redis_client.setex.return_value = True
         self.mock_redis_client.get.side_effect = redis.RedisError("Connection failed")
         
-        # Should still return True because setex succeeded
+        # Should return False because verification failed with exception
         result = self.redis_service.save_error_info("task-123", "Error")
-        self.assertTrue(result)
+        self.assertFalse(result)
 
     # ------------------------------------------------------------------
     # Test save_progress_info

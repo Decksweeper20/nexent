@@ -1,5 +1,4 @@
 from consts.exceptions import MCPConnectionError, NotFoundException, ToolExecutionException
-from consts.model import ToolInfo, ToolSourceEnum, ToolInstanceInfoRequest, ToolValidateRequest
 import asyncio
 import inspect
 import os
@@ -100,6 +99,170 @@ for name in ["truncate_content", "extract_code_from_text"]:
     setattr(mock_smolagents.utils, name, MagicMock(
         name=f"smolagents.utils.{name}"))
 
+# Mock nexent module and its submodules before patching
+
+
+def _create_package_mock(name):
+    """Helper to create a package-like mock module."""
+    pkg = types.ModuleType(name)
+    pkg.__path__ = []
+    return pkg
+
+
+nexent_mock = _create_package_mock('nexent')
+sys.modules['nexent'] = nexent_mock
+sys.modules['nexent.core'] = _create_package_mock('nexent.core')
+sys.modules['nexent.core.agents'] = _create_package_mock('nexent.core.agents')
+sys.modules['nexent.core.agents.agent_model'] = MagicMock()
+sys.modules['nexent.core.models'] = _create_package_mock('nexent.core.models')
+
+
+class MockMessageObserver:
+    """Lightweight stand-in for nexent.MessageObserver."""
+    pass
+
+
+# Expose MessageObserver on top-level nexent package
+setattr(sys.modules['nexent'], 'MessageObserver', MockMessageObserver)
+
+# Mock embedding model module to satisfy vectordatabase_service imports
+embedding_model_module = types.ModuleType('nexent.core.models.embedding_model')
+
+
+class MockBaseEmbedding:
+    pass
+
+
+class MockOpenAICompatibleEmbedding(MockBaseEmbedding):
+    pass
+
+
+class MockJinaEmbedding(MockBaseEmbedding):
+    pass
+
+
+embedding_model_module.BaseEmbedding = MockBaseEmbedding
+embedding_model_module.OpenAICompatibleEmbedding = MockOpenAICompatibleEmbedding
+embedding_model_module.JinaEmbedding = MockJinaEmbedding
+sys.modules['nexent.core.models.embedding_model'] = embedding_model_module
+
+# Provide model class used by file_management_service imports
+
+
+class MockOpenAILongContextModel:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+setattr(sys.modules['nexent.core.models'],
+        'OpenAILongContextModel', MockOpenAILongContextModel)
+
+# Provide vision model class used by image_service imports
+
+
+class MockOpenAIVLModel:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+setattr(sys.modules['nexent.core.models'],
+        'OpenAIVLModel', MockOpenAIVLModel)
+
+# Mock vector database modules used by vectordatabase_service
+sys.modules['nexent.vector_database'] = _create_package_mock(
+    'nexent.vector_database')
+vector_database_base_module = types.ModuleType('nexent.vector_database.base')
+vector_database_elasticsearch_module = types.ModuleType(
+    'nexent.vector_database.elasticsearch_core')
+
+
+class MockVectorDatabaseCore:
+    pass
+
+
+class MockElasticSearchCore(MockVectorDatabaseCore):
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+vector_database_base_module.VectorDatabaseCore = MockVectorDatabaseCore
+vector_database_elasticsearch_module.ElasticSearchCore = MockElasticSearchCore
+sys.modules['nexent.vector_database.base'] = vector_database_base_module
+sys.modules['nexent.vector_database.elasticsearch_core'] = vector_database_elasticsearch_module
+
+# Expose submodules on parent packages
+setattr(sys.modules['nexent.core'], 'models',
+        sys.modules['nexent.core.models'])
+setattr(sys.modules['nexent.core.models'], 'embedding_model',
+        sys.modules['nexent.core.models.embedding_model'])
+setattr(sys.modules['nexent'], 'vector_database',
+        sys.modules['nexent.vector_database'])
+setattr(sys.modules['nexent.vector_database'], 'base',
+        sys.modules['nexent.vector_database.base'])
+setattr(sys.modules['nexent.vector_database'], 'elasticsearch_core',
+        sys.modules['nexent.vector_database.elasticsearch_core'])
+
+# Mock nexent.storage module and its submodules
+sys.modules['nexent.storage'] = _create_package_mock('nexent.storage')
+storage_factory_module = types.ModuleType(
+    'nexent.storage.storage_client_factory')
+storage_config_module = types.ModuleType('nexent.storage.minio_config')
+
+# Create mock classes/functions
+
+
+class MockMinIOStorageConfig:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def validate(self):
+        pass
+
+
+storage_factory_module.create_storage_client_from_config = MagicMock()
+storage_factory_module.MinIOStorageConfig = MockMinIOStorageConfig
+storage_config_module.MinIOStorageConfig = MockMinIOStorageConfig
+
+# Ensure nested packages are reachable via attributes
+setattr(sys.modules['nexent'], 'storage', sys.modules['nexent.storage'])
+# Expose submodules on the storage package for patch lookups
+setattr(sys.modules['nexent.storage'],
+        'storage_client_factory', storage_factory_module)
+setattr(sys.modules['nexent.storage'], 'minio_config', storage_config_module)
+sys.modules['nexent.storage.storage_client_factory'] = storage_factory_module
+sys.modules['nexent.storage.minio_config'] = storage_config_module
+
+# Load actual backend modules so that patch targets resolve correctly
+import importlib  # noqa: E402
+backend_module = importlib.import_module('backend')
+sys.modules['backend'] = backend_module
+backend_database_module = importlib.import_module('backend.database')
+sys.modules['backend.database'] = backend_database_module
+backend_database_client_module = importlib.import_module(
+    'backend.database.client')
+sys.modules['backend.database.client'] = backend_database_client_module
+backend_services_module = importlib.import_module(
+    'backend.services.tool_configuration_service')
+# Ensure services package can resolve tool_configuration_service for patching
+sys.modules['services.tool_configuration_service'] = backend_services_module
+
+# Mock services modules
+sys.modules['services'] = _create_package_mock('services')
+services_modules = {
+    'file_management_service': {'get_llm_model': MagicMock()},
+    'vectordatabase_service': {'get_embedding_model': MagicMock(), 'get_vector_db_core': MagicMock(),
+                               'ElasticSearchService': MagicMock()},
+    'tenant_config_service': {'get_selected_knowledge_list': MagicMock(), 'build_knowledge_name_mapping': MagicMock()},
+    'image_service': {'get_vlm_model': MagicMock()}
+}
+for service_name, attrs in services_modules.items():
+    service_module = types.ModuleType(f'services.{service_name}')
+    for attr_name, attr_value in attrs.items():
+        setattr(service_module, attr_name, attr_value)
+    sys.modules[f'services.{service_name}'] = service_module
+    # Expose on parent package for patch resolution
+    setattr(sys.modules['services'], service_name, service_module)
+
 # Patch storage factory and MinIO config validation to avoid errors during initialization
 # These patches must be started before any imports that use MinioClient
 storage_client_mock = MagicMock()
@@ -123,6 +286,7 @@ patch('services.tenant_config_service.build_knowledge_name_mapping',
 patch('services.image_service.get_vlm_model', MagicMock()).start()
 
 # Import consts after patching dependencies
+from consts.model import ToolInfo, ToolSourceEnum, ToolInstanceInfoRequest, ToolValidateRequest  # noqa: E402
 
 
 class TestPythonTypeToJsonSchema:
