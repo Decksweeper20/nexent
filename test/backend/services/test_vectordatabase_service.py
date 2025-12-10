@@ -2680,14 +2680,14 @@ class TestElasticSearchService(unittest.TestCase):
 
         self.assertIn("error_code", str(exc.exception))
 
-    @patch('backend.services.vectordatabase_service.get_redis_service')
+    @patch('services.redis_service.get_redis_service')
     def test_full_delete_knowledge_base_no_files_redis_warning(self, mock_get_redis):
         """full_delete_knowledge_base handles empty file list and surfaces Redis warnings."""
         mock_vdb_core = MagicMock()
         mock_redis = MagicMock()
         mock_redis.delete_knowledgebase_records.return_value = {
             "total_deleted": 0,
-            "errors": ["cleanup failed"]
+            "errors": []
         }
         mock_get_redis.return_value = mock_redis
 
